@@ -9,6 +9,7 @@
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/JointState.h>
 #include <sensor_msgs/image_encodings.h>
+#include <std_msgs/Bool.h>
 #include <std_msgs/Float32.h>
 #include <std_msgs/String.h>
 
@@ -100,6 +101,12 @@ Params loadParams(ros::NodeHandle& pnh) {
   pnh.param("predictive/cover/lo", c.lo, c.lo);
   pnh.param("predictive/cover/hi", c.hi, c.hi);
   pnh.param("predictive/cover/floor", c.floor, c.floor);
+
+  auto& k = p.stuck;
+  pnh.param("stuck/enable", k.enable, k.enable);
+  pnh.param("stuck/min_cmd_v", k.min_cmd_v, k.min_cmd_v);
+  pnh.param("stuck/max_body_speed", k.max_body_speed, k.max_body_speed);
+  pnh.param("stuck/dwell_s", k.dwell_s, k.dwell_s);
   return p;
 }
 }  // namespace
@@ -119,7 +126,10 @@ class OverwatchNode {
     pnh.param("publish_rate", publish_rate, publish_rate);
 
     state_pub_ = nh.advertise<State>("overwatch/state", 10);
-    if (apply_) factor_pub_ = nh.advertise<std_msgs::Float32>("overwatch/speed_factor", 10);
+    if (apply_) {
+      factor_pub_ = nh.advertise<std_msgs::Float32>("overwatch/speed_factor", 10);
+      stuck_pub_ = nh.advertise<std_msgs::Bool>("overwatch/stuck", 10);
+    }
     sub_imu_ = nh.subscribe("imu/data", 2000, &OverwatchNode::onImu, this);
     sub_odom_ = nh.subscribe("lio_odom", 50, &OverwatchNode::onOdom, this);
     sub_wheels_ = nh.subscribe("md80/joint_states", 200, &OverwatchNode::onWheels, this);
@@ -196,6 +206,9 @@ class OverwatchNode {
       std_msgs::Float32 f;
       f.data = o.speed_factor;
       factor_pub_.publish(f);
+      std_msgs::Bool b;
+      b.data = o.stuck;
+      stuck_pub_.publish(b);
     }
 
     State st;
@@ -222,8 +235,14 @@ class OverwatchNode {
     st.odometer = o.odometer;
     st.cover_compute_ms = o.cover_compute_ms;
     st.stale = o.stale;
+    st.stuck = o.stuck;
+    st.stuck_s = o.stuck_s;
     state_pub_.publish(st);
 
+    if (o.stuck != logged_stuck_) {
+      ROS_INFO("overwatch: stuck=%s", o.stuck ? "true" : "false");
+      logged_stuck_ = o.stuck;
+    }
     if (o.limiting != logged_limiter_ && (now - last_log_).toSec() >= 1.0) {
       ROS_INFO("overwatch: limiting=%s factor=%.2f", limiterName(o.limiting), o.speed_factor);
       logged_limiter_ = o.limiting;
@@ -235,11 +254,12 @@ class OverwatchNode {
   bool apply_ = false;
   double imu_yaw_deg_ = 90.0, wheel_radius_ = 0.13;
   double stale_imu_ = 0.2, stale_odom_ = 0.5, stale_wheels_ = 0.5, stale_cmd_ = 0.5, stale_image_ = 0.5;
-  ros::Publisher state_pub_, factor_pub_;
+  ros::Publisher state_pub_, factor_pub_, stuck_pub_;
   ros::Subscriber sub_imu_, sub_odom_, sub_wheels_, sub_cmd_, sub_image_, sub_meta_;
   ros::Timer timer_;
   ros::Time imu_rx_, odom_rx_, wheels_rx_, cmd_rx_, image_rx_, last_log_;
   uint8_t logged_limiter_ = kNone;
+  bool logged_stuck_ = false;
 };
 
 }  // namespace overwatch

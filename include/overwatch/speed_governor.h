@@ -74,6 +74,14 @@ struct Params {
     double hold_m = 0.8;
   } push;
 
+  // Stuck: the drive is commanded but the body does not move. Reported only; it never changes the factor.
+  struct Stuck {
+    bool enable = true;
+    float min_cmd_v = 0.1f;             // m/s, |commanded linear speed|
+    float max_body_speed = 0.05f;       // m/s, LIO speed
+    double dwell_s = 1.0;               // the condition must hold this long
+  } stuck;
+
   struct Cover {
     bool enable = true;
     float half_sector_deg = 45.f;
@@ -102,6 +110,8 @@ struct Output {
   float lio_speed = 0.f, wheel_speed = 0.f, odometer = 0.f;
   float cover_compute_ms = 0.f;
   uint8_t stale = 0;
+  bool stuck = false;
+  float stuck_s = 0.f;                      // how long the stuck condition has held, 0 when it does not
 };
 
 class SpeedGovernor {
@@ -142,6 +152,7 @@ class SpeedGovernor {
   Eigen::Vector2d last_counted_ = Eigen::Vector2d::Zero();
   bool have_odom_ = false;
   double odometer_ = 0.0, speed_ = 0.0;
+  bool speed_valid_ = false;  // speed_ spans at least speed_min_span_s
   double roll_ = 0.0, pitch_ = 0.0;
   bool attitude_valid_ = false;  // cleared by a stale tick, so the cover rule levels with zero attitude
 
@@ -160,6 +171,10 @@ class SpeedGovernor {
   float cover_raw_ = 0.f;
   uint32_t cover_expected_ = 0;
   float cover_compute_ms_ = 0.f;
+
+  // Stuck
+  double stuck_since_ = 0.0;
+  bool stuck_candidate_ = false;
 
   // Output stage
   float factor_ = 1.f;

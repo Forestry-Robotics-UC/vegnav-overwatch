@@ -42,3 +42,6 @@ uint8 WHEELS = 4
 uint8 CMD = 8
 uint8 IMAGE = 16
 uint8 stale
+
+bool stuck                       # commanded but not moving for stuck/dwell_s; published on /overwatch/stuck
+float32 stuck_s                  # how long the stuck condition has held, 0 when it does not

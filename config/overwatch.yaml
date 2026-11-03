@@ -58,3 +58,9 @@ predictive:
     lo: 0.03
     hi: 0.2
     floor: 0.6
+
+stuck:                  # commanded but not moving; reported on /overwatch/stuck, never changes the factor
+  enable: true
+  min_cmd_v: 0.1        # m/s, |commanded linear speed|
+  max_body_speed: 0.05  # m/s, LIO speed
+  dwell_s: 1.0

@@ -116,7 +116,8 @@ bool SpeedGovernor::addOdom(double stamp, const Eigen::Vector2d& p, double roll,
   odom_window_.push_back({stamp, p});
   while (odom_window_.front().t < stamp - p_.speed_window_s) odom_window_.pop_front();
   const double span = stamp - odom_window_.front().t;
-  speed_ = span >= p_.speed_min_span_s ? (p - odom_window_.front().p).norm() / span : 0.0;
+  speed_valid_ = span >= p_.speed_min_span_s;
+  speed_ = speed_valid_ ? (p - odom_window_.front().p).norm() / span : 0.0;
   return true;
 }
 
@@ -205,6 +206,7 @@ Output SpeedGovernor::update(double now, const Stale& stale) {
   if (stale.odom) {
     attitude_valid_ = false;
     speed_ = 0.0;
+    speed_valid_ = false;
     rotation_hold_.reset(odometer_);
     push_hold_.reset(odometer_);
   }
@@ -279,6 +281,18 @@ Output SpeedGovernor::update(double now, const Stale& stale) {
     o.cover_avg = sum / cover_fractions_.size();
     if (p_.predictive && p_.cover.enable)
       o.cover_factor = interp(o.cover_avg, p_.cover.lo, p_.cover.hi, 1.f, p_.cover.floor);
+  }
+
+  // Stuck. A stale or too-short odometry window reads as speed 0, so it must not count as standing still.
+  {
+    const auto& k = p_.stuck;
+    const bool candidate = k.enable && finite(now) && !stale.odom && speed_valid_ && have_cmd_ && !stale.cmd &&
+                           std::fabs(static_cast<float>(cmd_v_)) >= k.min_cmd_v &&
+                           static_cast<float>(speed_) < k.max_body_speed;
+    if (candidate && !stuck_candidate_) stuck_since_ = now;
+    stuck_candidate_ = candidate;
+    o.stuck_s = candidate ? static_cast<float>(now - stuck_since_) : 0.f;
+    o.stuck = candidate && now - stuck_since_ >= k.dwell_s;
   }
 
   // Output stage: falls at once, recovers at release_rate.

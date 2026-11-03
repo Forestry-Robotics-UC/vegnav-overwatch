@@ -565,6 +565,89 @@ TEST(LioSpeed, GapGivesZero) {
   EXPECT_FLOAT_EQ(g.update(0.0, Stale()).lio_speed, 0.f);
 }
 
+// Stuck: odometry at 10 Hz, the update clock following it.
+struct StuckRig {
+  SpeedGovernor g{only(kOnlyTilt)};
+  OdomFeed odom{g};
+  Output run(double speed, double duration) {
+    Output o;
+    const int n = std::lround(duration * 10.0);
+    for (int i = 0; i < n; ++i) {
+      odom.step(speed * 0.1);
+      o = g.update(odom.t, Stale());
+    }
+    return o;
+  }
+};
+
+TEST(Stuck, CommandedButStillFiresAfterDwell) {
+  StuckRig r;
+  r.run(0.5, 1.0);
+  ASSERT_TRUE(r.g.addCommand(0.5));
+  EXPECT_FALSE(r.run(0.0, 0.9).stuck);  // the speed window still holds motion, then the dwell starts
+  const Output o = r.run(0.0, 1.0);
+  EXPECT_TRUE(o.stuck);
+  EXPECT_GE(o.stuck_s, 1.0f - kTol);
+}
+
+TEST(Stuck, NotWhileMovingOrWithoutCommand) {
+  StuckRig r;
+  ASSERT_TRUE(r.g.addCommand(0.5));
+  EXPECT_FALSE(r.run(0.2, 3.0).stuck);
+  ASSERT_TRUE(r.g.addCommand(0.05));    // below min_cmd_v: a deliberate stop
+  EXPECT_FALSE(r.run(0.0, 3.0).stuck);
+  StuckRig n;                            // no command ever received
+  EXPECT_FALSE(n.run(0.0, 3.0).stuck);
+}
+
+TEST(Stuck, ReverseCommandCounts) {
+  StuckRig r;
+  ASSERT_TRUE(r.g.addCommand(-0.3));
+  EXPECT_TRUE(r.run(0.0, 2.0).stuck);
+}
+
+TEST(Stuck, ClearsWhenTheBodyMoves) {
+  StuckRig r;
+  ASSERT_TRUE(r.g.addCommand(0.5));
+  ASSERT_TRUE(r.run(0.0, 2.0).stuck);
+  const Output o = r.run(0.3, 1.0);
+  EXPECT_FALSE(o.stuck);
+  EXPECT_FLOAT_EQ(o.stuck_s, 0.f);
+}
+
+TEST(Stuck, StaleOrGappedOdometryIsNotStandingStill) {
+  StuckRig r;
+  ASSERT_TRUE(r.g.addCommand(0.5));
+  r.run(0.0, 2.0);
+  Stale s;
+  s.odom = true;
+  EXPECT_FALSE(r.g.update(r.odom.t + 0.1, s).stuck);
+  // After a gap the window restarts below its minimum span: speed reads 0 but is not valid.
+  StuckRig q;
+  ASSERT_TRUE(q.g.addCommand(0.5));
+  q.run(0.5, 1.0);
+  ASSERT_TRUE(q.g.addOdom(q.odom.t + 2.0, Eigen::Vector2d(q.odom.x, 0.0), 0.0, 0.0));
+  EXPECT_FALSE(q.g.update(q.odom.t + 2.0, Stale()).stuck);
+  EXPECT_FALSE(q.g.update(q.odom.t + 3.5, Stale()).stuck);
+}
+
+TEST(Stuck, StaleCommandDoesNotCount) {
+  StuckRig r;
+  ASSERT_TRUE(r.g.addCommand(0.5));
+  r.run(0.0, 2.0);
+  Stale s;
+  s.cmd = true;
+  EXPECT_FALSE(r.g.update(r.odom.t, s).stuck);
+}
+
+TEST(Stuck, NeverChangesTheFactor) {
+  StuckRig r;
+  ASSERT_TRUE(r.g.addCommand(0.5));
+  const Output o = r.run(0.0, 3.0);
+  ASSERT_TRUE(o.stuck);
+  EXPECT_FLOAT_EQ(o.speed_factor, 1.f);
+}
+
 TEST(Odom, NonFiniteIsRejectedAndKeepsAttitude) {
   SpeedGovernor g(only(kOnlyTilt));
   ASSERT_TRUE(g.addOdom(0.0, Eigen::Vector2d::Zero(), 20 * kD2R, 0.0));
