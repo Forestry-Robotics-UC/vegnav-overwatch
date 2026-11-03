@@ -1,0 +1,8 @@
+<launch>
+  <!-- Speed governor. apply:=false is shadow mode: /overwatch/state only, no speed factor. -->
+  <arg name="apply" default="false" />
+  <node pkg="overwatch" type="overwatch_node" name="overwatch" output="screen">
+    <rosparam command="load" file="$(find overwatch)/config/overwatch.yaml"/>
+    <param name="apply" value="$(arg apply)" />
+  </node>
+</launch>

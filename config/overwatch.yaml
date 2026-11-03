@@ -1,0 +1,60 @@
+# Thresholds are first guesses from offline analysis, see
+# ~/data/experiments/2026-10-30_overwatch_speed_governor/RESULTS.md
+apply: false            # the launch file overrides this
+publish_rate: 20.0      # Hz
+release_rate: 0.25      # factor per second
+imu_yaw_deg: 90.0       # base_link -> LPMS
+wheel_radius: 0.13      # m
+
+odometer_deadband_m: 0.05
+speed_window_s: 0.5
+speed_min_span_s: 0.3
+
+stale:                  # s since arrival, ROS time
+  imu: 0.2
+  odom: 0.5
+  wheels: 0.5
+  cmd: 0.5
+  image: 0.5
+
+proprioceptive:
+  enable: true
+  tilt:                 # deg -> factor
+    enable: true
+    roll_lo: 5.0
+    roll_hi: 20.0
+    roll_floor: 0.35
+    pitch_lo: 10.0
+    pitch_hi: 25.0
+    pitch_floor: 0.5
+  rotation:             # bump or climb: deg over the window -> factor
+    enable: true
+    window_s: 0.5
+    max_dt_s: 0.1       # longer IMU gaps restart the window
+    lo: 5.0
+    hi: 9.0
+    floor: 0.3
+    min_speed: 0.1      # m/s, larger of LIO and wheel speed
+    hold_m: 0.8         # about one axle spacing
+  push:                 # net wheel torque residual -> factor
+    enable: true
+    window_s: 0.2
+    baseline: 11.6
+    slope_gain: 59.4
+    lo: 18.0
+    hi: 28.0
+    floor: 0.3
+    min_cmd_v: 0.1      # m/s
+    hold_m: 0.8
+
+predictive:
+  enable: true
+  cover:                # forward no-return fraction -> factor
+    enable: true
+    half_sector_deg: 45.0
+    max_ray_z: -0.02    # levelled rays above this never had ground to hit
+    min_rays: 100
+    window_sweeps: 3
+    lo: 0.03
+    hi: 0.2
+    floor: 0.6
