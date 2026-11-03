@@ -41,7 +41,9 @@ uint8 ODOM = 2
 uint8 WHEELS = 4
 uint8 CMD = 8
 uint8 IMAGE = 16
+uint8 AUTONOMY = 32               # pure pursuit's command, read only by the stuck rule
 uint8 stale
 
-bool stuck                       # commanded but not moving for stuck/dwell_s; published on /overwatch/stuck
+bool stuck                       # pure pursuit drives, the wheels push or spin, the body does not move,
+                                 # for stuck/dwell_s; published on /overwatch/stuck
 float32 stuck_s                  # how long the stuck condition has held, 0 when it does not

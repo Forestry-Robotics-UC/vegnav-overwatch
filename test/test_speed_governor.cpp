@@ -565,16 +565,24 @@ TEST(LioSpeed, GapGivesZero) {
   EXPECT_FLOAT_EQ(g.update(0.0, Stale()).lio_speed, 0.f);
 }
 
-// Stuck: odometry at 10 Hz, the update clock following it.
+// Stuck: odometry and wheels at 10 Hz, the update clock following them. By default the drive pushes hard
+// (net 40, residual 28) with still wheels, and pure pursuit's command is the base command.
 struct StuckRig {
   SpeedGovernor g{only(kOnlyTilt)};
   OdomFeed odom{g};
-  Output run(double speed, double duration) {
+  double net = 40.0, wheel = 0.0;
+  bool autonomy_follows = true;
+  void cmd(double v) {
+    ASSERT_TRUE(g.addCommand(v));
+    if (autonomy_follows) ASSERT_TRUE(g.addAutonomyCommand(v));
+  }
+  Output run(double speed, double duration, Stale s = Stale()) {
     Output o;
     const int n = std::lround(duration * 10.0);
     for (int i = 0; i < n; ++i) {
       odom.step(speed * 0.1);
-      o = g.update(odom.t, Stale());
+      EXPECT_TRUE(g.addWheels(odom.t, net, wheel));
+      o = g.update(odom.t, s);
     }
     return o;
   }
@@ -583,7 +591,7 @@ struct StuckRig {
 TEST(Stuck, CommandedButStillFiresAfterDwell) {
   StuckRig r;
   r.run(0.5, 1.0);
-  ASSERT_TRUE(r.g.addCommand(0.5));
+  r.cmd(0.5);
   EXPECT_FALSE(r.run(0.0, 0.9).stuck);  // the speed window still holds motion, then the dwell starts
   const Output o = r.run(0.0, 1.0);
   EXPECT_TRUE(o.stuck);
@@ -592,9 +600,9 @@ TEST(Stuck, CommandedButStillFiresAfterDwell) {
 
 TEST(Stuck, NotWhileMovingOrWithoutCommand) {
   StuckRig r;
-  ASSERT_TRUE(r.g.addCommand(0.5));
+  r.cmd(0.5);
   EXPECT_FALSE(r.run(0.2, 3.0).stuck);
-  ASSERT_TRUE(r.g.addCommand(0.05));    // below min_cmd_v: a deliberate stop
+  r.cmd(0.05);    // below min_cmd_v: a deliberate stop
   EXPECT_FALSE(r.run(0.0, 3.0).stuck);
   StuckRig n;                            // no command ever received
   EXPECT_FALSE(n.run(0.0, 3.0).stuck);
@@ -602,13 +610,13 @@ TEST(Stuck, NotWhileMovingOrWithoutCommand) {
 
 TEST(Stuck, ReverseCommandCounts) {
   StuckRig r;
-  ASSERT_TRUE(r.g.addCommand(-0.3));
+  r.cmd(-0.3);
   EXPECT_TRUE(r.run(0.0, 2.0).stuck);
 }
 
 TEST(Stuck, ClearsWhenTheBodyMoves) {
   StuckRig r;
-  ASSERT_TRUE(r.g.addCommand(0.5));
+  r.cmd(0.5);
   ASSERT_TRUE(r.run(0.0, 2.0).stuck);
   const Output o = r.run(0.3, 1.0);
   EXPECT_FALSE(o.stuck);
@@ -617,14 +625,14 @@ TEST(Stuck, ClearsWhenTheBodyMoves) {
 
 TEST(Stuck, StaleOrGappedOdometryIsNotStandingStill) {
   StuckRig r;
-  ASSERT_TRUE(r.g.addCommand(0.5));
+  r.cmd(0.5);
   r.run(0.0, 2.0);
   Stale s;
   s.odom = true;
   EXPECT_FALSE(r.g.update(r.odom.t + 0.1, s).stuck);
   // After a gap the window restarts below its minimum span: speed reads 0 but is not valid.
   StuckRig q;
-  ASSERT_TRUE(q.g.addCommand(0.5));
+  q.cmd(0.5);
   q.run(0.5, 1.0);
   ASSERT_TRUE(q.g.addOdom(q.odom.t + 2.0, Eigen::Vector2d(q.odom.x, 0.0), 0.0, 0.0));
   EXPECT_FALSE(q.g.update(q.odom.t + 2.0, Stale()).stuck);
@@ -633,7 +641,7 @@ TEST(Stuck, StaleOrGappedOdometryIsNotStandingStill) {
 
 TEST(Stuck, StaleCommandDoesNotCount) {
   StuckRig r;
-  ASSERT_TRUE(r.g.addCommand(0.5));
+  r.cmd(0.5);
   r.run(0.0, 2.0);
   Stale s;
   s.cmd = true;
@@ -642,10 +650,50 @@ TEST(Stuck, StaleCommandDoesNotCount) {
 
 TEST(Stuck, NeverChangesTheFactor) {
   StuckRig r;
-  ASSERT_TRUE(r.g.addCommand(0.5));
+  r.cmd(0.5);
   const Output o = r.run(0.0, 3.0);
   ASSERT_TRUE(o.stuck);
   EXPECT_FLOAT_EQ(o.speed_factor, 1.f);
+}
+
+TEST(Stuck, MotorsOffHoldIsNotStuck) {
+  StuckRig r;
+  r.net = 0.0;  // no torque, wheels still: the operator cut the motors
+  r.cmd(0.5);
+  EXPECT_FALSE(r.run(0.0, 3.0).stuck);
+}
+
+TEST(Stuck, SpinningWheelsWithLittleTorqueCount) {
+  StuckRig r;
+  r.net = 12.0;  // residual 0.4: not pushing
+  r.wheel = 0.2;
+  r.cmd(0.5);
+  EXPECT_TRUE(r.run(0.0, 3.0).stuck);
+}
+
+TEST(Stuck, JoystickIsNotStuck) {
+  StuckRig r;
+  r.autonomy_follows = false;
+  ASSERT_TRUE(r.g.addAutonomyCommand(0.6));  // pure pursuit wants 0.6, the joystick sends 0.3
+  r.cmd(0.3);
+  EXPECT_FALSE(r.run(0.0, 3.0).stuck);
+  r.cmd(0.62);                               // back to autonomy, within the mismatch
+  EXPECT_TRUE(r.run(0.0, 2.0).stuck);
+}
+
+TEST(Stuck, NeedsWheelsAndPurePursuit) {
+  StuckRig r;
+  r.cmd(0.5);
+  Stale no_auto;
+  no_auto.autonomy = true;
+  EXPECT_FALSE(r.run(0.0, 3.0, no_auto).stuck);
+  Stale no_wheels;
+  no_wheels.wheels = true;
+  EXPECT_FALSE(r.run(0.0, 3.0, no_wheels).stuck);
+  StuckRig n;  // pure pursuit never published
+  n.autonomy_follows = false;
+  n.cmd(0.5);
+  EXPECT_FALSE(n.run(0.0, 3.0).stuck);
 }
 
 TEST(Odom, NonFiniteIsRejectedAndKeepsAttitude) {

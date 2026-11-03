@@ -64,3 +64,9 @@ stuck:                  # commanded but not moving; reported on /overwatch/stuck
   min_cmd_v: 0.1        # m/s, |commanded linear speed|
   max_body_speed: 0.05  # m/s, LIO speed
   dwell_s: 1.0
+  # Operator holds are not stuck: the base command must be pure pursuit's (not the joystick), and the drive
+  # must push (torque residual) or spin (wheel speed). No wheels or no pure pursuit command: never fires.
+  autonomy_cmd_topic: ros1/cmd_vel_stamped
+  max_cmd_mismatch: 0.05   # m/s
+  min_effort_residual: 8.0 # push residual units
+  min_wheel_speed: 0.1     # m/s

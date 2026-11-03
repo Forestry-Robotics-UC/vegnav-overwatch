@@ -40,7 +40,8 @@ class DistanceHold {
 };
 
 enum Limiter : uint8_t { kNone = 0, kTilt = 1, kRotation = 2, kPush = 3, kCover = 4 };
-enum StaleBit : uint8_t { kStaleImu = 1, kStaleOdom = 2, kStaleWheels = 4, kStaleCmd = 8, kStaleImage = 16 };
+enum StaleBit : uint8_t { kStaleImu = 1, kStaleOdom = 2, kStaleWheels = 4, kStaleCmd = 8, kStaleImage = 16,
+                         kStaleAutonomy = 32 };
 
 struct Params {
   float release_rate = 0.25f;           // factor per second
@@ -80,6 +81,11 @@ struct Params {
     float min_cmd_v = 0.1f;             // m/s, |commanded linear speed|
     float max_body_speed = 0.05f;       // m/s, LIO speed
     double dwell_s = 1.0;               // the condition must hold this long
+    // Not an operator hold: the drive is trying (pushing or spinning), and the command reaching the base is
+    // pure pursuit's (not the joystick). Without wheels or pure pursuit's command it never fires.
+    float min_effort_residual = 8.f;    // push residual, same units as Push
+    float min_wheel_speed = 0.1f;       // m/s, |mean wheel speed|
+    float max_cmd_mismatch = 0.05f;     // m/s, |base command - pure pursuit command|
   } stuck;
 
   struct Cover {
@@ -95,6 +101,7 @@ struct Params {
 // Decided by the caller from arrival times.
 struct Stale {
   bool imu = false, odom = false, wheels = false, cmd = false, image = false;
+  bool autonomy = false;  // pure pursuit's own command (only the stuck rule reads it)
 };
 
 struct Output {
@@ -123,6 +130,7 @@ class SpeedGovernor {
   bool addOdom(double stamp, const Eigen::Vector2d& p, double roll, double pitch);
   bool addWheels(double stamp, double net_effort, double wheel_speed);
   bool addCommand(double v);
+  bool addAutonomyCommand(double v);  // pure pursuit's output, before the mux
   // mono16, row-major, rows * step_bytes readable. Only zero / non-zero matters, so byte order does not.
   bool addRangeImage(const uint8_t* data, int rows, int cols, size_t step_bytes);
   bool setBeamAltitudes(const std::vector<float>& deg);
@@ -161,6 +169,8 @@ class SpeedGovernor {
   double wheel_speed_ = 0.0;
   double cmd_v_ = 0.0;
   bool have_cmd_ = false;
+  double auto_v_ = 0.0;
+  bool have_auto_ = false;
   DistanceHold push_hold_;
 
   // Cover

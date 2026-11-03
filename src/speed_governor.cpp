@@ -130,6 +130,13 @@ bool SpeedGovernor::addWheels(double stamp, double net_effort, double wheel_spee
   return true;
 }
 
+bool SpeedGovernor::addAutonomyCommand(double v) {
+  if (!finite(v)) return false;
+  auto_v_ = v;
+  have_auto_ = true;
+  return true;
+}
+
 bool SpeedGovernor::addCommand(double v) {
   if (!finite(v)) return false;
   cmd_v_ = v;
@@ -200,7 +207,7 @@ bool SpeedGovernor::addRangeImage(const uint8_t* data, int rows, int cols, size_
 Output SpeedGovernor::update(double now, const Stale& stale) {
   Output o;
   o.stale = (stale.imu ? kStaleImu : 0) | (stale.odom ? kStaleOdom : 0) | (stale.wheels ? kStaleWheels : 0) |
-            (stale.cmd ? kStaleCmd : 0) | (stale.image ? kStaleImage : 0);
+            (stale.cmd ? kStaleCmd : 0) | (stale.image ? kStaleImage : 0) | (stale.autonomy ? kStaleAutonomy : 0);
 
   // The odometer cannot advance, so a hold could never release: drop them rather than latch.
   if (stale.odom) {
@@ -284,9 +291,17 @@ Output SpeedGovernor::update(double now, const Stale& stale) {
   }
 
   // Stuck. A stale or too-short odometry window reads as speed 0, so it must not count as standing still.
+  // An operator hold is not stuck: the joystick (base command differs from pure pursuit's) or motors off
+  // (no torque, wheels still).
   {
     const auto& k = p_.stuck;
+    const bool autonomy = have_auto_ && !stale.autonomy &&
+                          std::fabs(static_cast<float>(cmd_v_ - auto_v_)) <= k.max_cmd_mismatch;
+    const bool driving = !stale.wheels && have_residual &&
+                         (o.effort_residual >= k.min_effort_residual ||
+                          std::fabs(o.wheel_speed) >= k.min_wheel_speed);
     const bool candidate = k.enable && finite(now) && !stale.odom && speed_valid_ && have_cmd_ && !stale.cmd &&
+                           autonomy && driving &&
                            std::fabs(static_cast<float>(cmd_v_)) >= k.min_cmd_v &&
                            static_cast<float>(speed_) < k.max_body_speed;
     if (candidate && !stuck_candidate_) stuck_since_ = now;

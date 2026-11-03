@@ -26,7 +26,8 @@ static_assert(int(State::NONE) == kNone && int(State::TILT) == kTilt && int(Stat
               int(State::PUSH) == kPush && int(State::COVER) == kCover, "limiter ids must match State.msg");
 static_assert(int(State::IMU) == kStaleImu && int(State::ODOM) == kStaleOdom &&
               int(State::WHEELS) == kStaleWheels && int(State::CMD) == kStaleCmd &&
-              int(State::IMAGE) == kStaleImage, "stale bits must match State.msg");
+              int(State::IMAGE) == kStaleImage && int(State::AUTONOMY) == kStaleAutonomy,
+              "stale bits must match State.msg");
 
 namespace {
 void rollPitch(const geometry_msgs::Quaternion& q, float* roll, float* pitch) {
@@ -107,6 +108,9 @@ Params loadParams(ros::NodeHandle& pnh) {
   pnh.param("stuck/min_cmd_v", k.min_cmd_v, k.min_cmd_v);
   pnh.param("stuck/max_body_speed", k.max_body_speed, k.max_body_speed);
   pnh.param("stuck/dwell_s", k.dwell_s, k.dwell_s);
+  pnh.param("stuck/min_effort_residual", k.min_effort_residual, k.min_effort_residual);
+  pnh.param("stuck/min_wheel_speed", k.min_wheel_speed, k.min_wheel_speed);
+  pnh.param("stuck/max_cmd_mismatch", k.max_cmd_mismatch, k.max_cmd_mismatch);
   return p;
 }
 }  // namespace
@@ -134,6 +138,9 @@ class OverwatchNode {
     sub_odom_ = nh.subscribe("lio_odom", 50, &OverwatchNode::onOdom, this);
     sub_wheels_ = nh.subscribe("md80/joint_states", 200, &OverwatchNode::onWheels, this);
     sub_cmd_ = nh.subscribe("diff_drive_controller/cmd_vel_out", 200, &OverwatchNode::onCmd, this);
+    std::string autonomy_topic = "ros1/cmd_vel_stamped";  // pure pursuit's cmd_vel_topic_name
+    pnh.param("stuck/autonomy_cmd_topic", autonomy_topic, autonomy_topic);
+    sub_auto_ = nh.subscribe(autonomy_topic, 200, &OverwatchNode::onAutonomyCmd, this);
     sub_image_ = nh.subscribe("ouster/range_image", 2, &OverwatchNode::onImage, this);
     sub_meta_ = nh.subscribe("ouster/metadata", 1, &OverwatchNode::onMeta, this);
     timer_ = nh.createTimer(ros::Duration(1.0 / publish_rate), &OverwatchNode::onTick, this);
@@ -163,6 +170,10 @@ class OverwatchNode {
 
   void onCmd(const geometry_msgs::TwistStamped& m) {
     if (gov_.addCommand(m.twist.linear.x)) cmd_rx_ = ros::Time::now();
+  }
+
+  void onAutonomyCmd(const geometry_msgs::TwistStamped& m) {
+    if (gov_.addAutonomyCommand(m.twist.linear.x)) auto_rx_ = ros::Time::now();
   }
 
   void onImage(const sensor_msgs::Image& m) {
@@ -200,6 +211,7 @@ class OverwatchNode {
     s.wheels = isStale(wheels_rx_, now, stale_wheels_);
     s.cmd = isStale(cmd_rx_, now, stale_cmd_);
     s.image = isStale(image_rx_, now, stale_image_);
+    s.autonomy = isStale(auto_rx_, now, stale_cmd_);
     const Output o = gov_.update(now.toSec(), s);
 
     if (apply_) {
@@ -255,9 +267,9 @@ class OverwatchNode {
   double imu_yaw_deg_ = 90.0, wheel_radius_ = 0.13;
   double stale_imu_ = 0.2, stale_odom_ = 0.5, stale_wheels_ = 0.5, stale_cmd_ = 0.5, stale_image_ = 0.5;
   ros::Publisher state_pub_, factor_pub_, stuck_pub_;
-  ros::Subscriber sub_imu_, sub_odom_, sub_wheels_, sub_cmd_, sub_image_, sub_meta_;
+  ros::Subscriber sub_imu_, sub_odom_, sub_wheels_, sub_cmd_, sub_auto_, sub_image_, sub_meta_;
   ros::Timer timer_;
-  ros::Time imu_rx_, odom_rx_, wheels_rx_, cmd_rx_, image_rx_, last_log_;
+  ros::Time imu_rx_, odom_rx_, wheels_rx_, cmd_rx_, auto_rx_, image_rx_, last_log_;
   uint8_t logged_limiter_ = kNone;
   bool logged_stuck_ = false;
 };
