@@ -28,9 +28,9 @@ Eigen::Vector2d imuToBase(double ix, double iy, double yaw_rad) {
 
 bool wheelsFromJoints(const std::vector<std::string>& names, const std::vector<double>& velocity,
                       const std::vector<double>& effort, double wheel_radius, double* net_effort,
-                      double* wheel_speed) {
+                      double* wheel_speed, double* abs_effort, double* wheel_yaw_speed) {
   if (velocity.size() < names.size() || effort.size() < names.size()) return false;
-  double net = 0.0, speed = 0.0;
+  double net = 0.0, speed = 0.0, abs_sum = 0.0, yaw = 0.0;
   int seen = 0;  // bitmask, so a repeated joint cannot stand in for a missing one
   for (size_t i = 0; i < names.size(); ++i) {
     double sign;
@@ -43,11 +43,16 @@ bool wheelsFromJoints(const std::vector<std::string>& names, const std::vector<d
     if (!finite(effort[i]) || !finite(velocity[i])) return false;
     net += sign * effort[i];
     speed += sign * velocity[i];
+    abs_sum += std::fabs(effort[i]);
+    // left joints (103, 101) have sign +1: forward left wheels turn the body clockwise
+    yaw += (sign > 0 ? -1.0 : 1.0) * sign * velocity[i];
     seen |= bit;
   }
   if (seen != 15) return false;
   *net_effort = net;
   *wheel_speed = speed / 4.0 * wheel_radius;
+  if (abs_effort) *abs_effort = abs_sum;
+  if (wheel_yaw_speed) *wheel_yaw_speed = yaw / 4.0 * wheel_radius;
   return true;
 }
 
@@ -97,8 +102,22 @@ bool SpeedGovernor::addImu(double stamp, double gx, double gy) {
   return true;
 }
 
-bool SpeedGovernor::addOdom(double stamp, const Eigen::Vector2d& p, double roll, double pitch) {
+bool SpeedGovernor::addOdom(double stamp, const Eigen::Vector2d& p, double roll, double pitch, double yaw) {
   if (!finite(stamp) || !p.allFinite() || !finite(roll) || !finite(pitch)) return false;
+  if (finite(yaw)) {
+    if (!yaw_hist_.empty() && stamp <= yaw_hist_.back().t) yaw_hist_.clear();
+    if (yaw_hist_.empty()) have_yaw_ = false;
+    if (!have_yaw_) {
+      yaw_unwrapped_ = yaw;
+      have_yaw_ = true;
+    } else {
+      const double prev = std::remainder(yaw_unwrapped_, 2.0 * M_PI);
+      yaw_unwrapped_ += std::remainder(yaw - prev, 2.0 * M_PI);
+    }
+    yaw_hist_.push_back({stamp, yaw_unwrapped_});
+    const double keep = std::max(p_.rotation_stuck.yaw_window_s, p_.rotation_stuck.progress_window_s) + 1.0;
+    while (yaw_hist_.front().t < stamp - keep) yaw_hist_.pop_front();
+  }
   if (!have_odom_) {
     last_counted_ = p;
     have_odom_ = true;
@@ -121,8 +140,11 @@ bool SpeedGovernor::addOdom(double stamp, const Eigen::Vector2d& p, double roll,
   return true;
 }
 
-bool SpeedGovernor::addWheels(double stamp, double net_effort, double wheel_speed) {
+bool SpeedGovernor::addWheels(double stamp, double net_effort, double wheel_speed, double abs_effort,
+                              double wheel_yaw_speed) {
   if (!finite(stamp) || !finite(net_effort) || !finite(wheel_speed)) return false;
+  wheel_abs_effort_ = abs_effort;
+  wheel_yaw_speed_ = wheel_yaw_speed;
   if (!wheel_window_.empty() && stamp <= wheel_window_.back().t) wheel_window_.clear();
   wheel_window_.push_back({stamp, net_effort});
   while (wheel_window_.front().t < stamp - p_.push.window_s) wheel_window_.pop_front();
@@ -130,16 +152,18 @@ bool SpeedGovernor::addWheels(double stamp, double net_effort, double wheel_spee
   return true;
 }
 
-bool SpeedGovernor::addAutonomyCommand(double v) {
-  if (!finite(v)) return false;
+bool SpeedGovernor::addAutonomyCommand(double v, double w) {
+  if (!finite(v) || !finite(w)) return false;
   auto_v_ = v;
+  auto_w_ = w;
   have_auto_ = true;
   return true;
 }
 
-bool SpeedGovernor::addCommand(double v) {
-  if (!finite(v)) return false;
+bool SpeedGovernor::addCommand(double v, double w) {
+  if (!finite(v) || !finite(w)) return false;
   cmd_v_ = v;
+  cmd_w_ = w;
   have_cmd_ = true;
   return true;
 }
@@ -221,7 +245,9 @@ Output SpeedGovernor::update(double now, const Stale& stale) {
   if (stale.wheels) {
     wheel_window_.clear();
     wheel_speed_ = 0.0;
+    wheel_abs_effort_ = wheel_yaw_speed_ = NAN;
   }
+  if (stale.odom) yaw_hist_.clear();
   const double roll = attitude_valid_ ? roll_ : 0.0, pitch = attitude_valid_ ? pitch_ : 0.0;
   o.roll_deg = roll / kDeg;
   o.pitch_deg = pitch / kDeg;
@@ -290,6 +316,79 @@ Output SpeedGovernor::update(double now, const Stale& stale) {
       o.cover_factor = interp(o.cover_avg, p_.cover.lo, p_.cover.hi, 1.f, p_.cover.floor);
   }
 
+  // Rotation stuck. Pure pursuit rotates in place (or wiggles, once latched), the base executes pure
+  // pursuit's command, and the wheels pivot or strain, but LIO yaw does not change.
+  {
+    const auto& q = p_.rotation_stuck;
+    // yaw change over [t_last - window, t_last] of the yaw history; false without enough span
+    auto yawChange = [this](double window, double* change, double* span) {
+      if (yaw_hist_.size() < 2) return false;
+      const double t1 = yaw_hist_.back().t;
+      auto it = yaw_hist_.begin();
+      while (it + 1 != yaw_hist_.end() && it->t < t1 - window) ++it;
+      *span = t1 - it->t;
+      *change = yaw_hist_.back().yaw - it->yaw;
+      return *span >= 0.7 * window;
+    };
+    double dyaw = 0.0, span = 0.0;
+    const bool rate_valid = !stale.odom && yawChange(q.yaw_window_s, &dyaw, &span);
+    const double yaw_rate = rate_valid ? dyaw / span : 0.0;
+    o.yaw_rate = static_cast<float>(yaw_rate);
+    o.wheel_yaw_speed = finite(wheel_yaw_speed_) ? static_cast<float>(wheel_yaw_speed_) : 0.f;
+    o.abs_effort = finite(wheel_abs_effort_) ? static_cast<float>(wheel_abs_effort_) : 0.f;
+
+    const bool autonomy = have_auto_ && !stale.autonomy && have_cmd_ && !stale.cmd &&
+                          std::fabs(cmd_v_ - auto_v_) <= p_.stuck.max_cmd_mismatch &&
+                          std::fabs(cmd_w_ - auto_w_) <= q.max_cmd_w_mismatch;
+    const bool turning = autonomy && std::fabs(auto_w_) >= q.min_cmd_w;
+
+    if (!q.enable || !finite(now)) {
+      rot_candidate_ = rot_latched_ = rot_escalated_ = rot_releasing_ = false;
+    } else {
+      if (!rot_latched_) {
+        const bool pivoting = !stale.wheels && finite(wheel_yaw_speed_) && finite(wheel_abs_effort_) &&
+                              (std::fabs(wheel_yaw_speed_) >= q.min_wheel_yaw_speed ||
+                               wheel_abs_effort_ >= q.min_abs_effort);
+        const bool candidate = turning && std::fabs(auto_v_) <= q.max_cmd_v && pivoting && rate_valid &&
+                               std::fabs(yaw_rate) < q.max_yaw_rate;
+        if (candidate && !rot_candidate_) rot_since_ = now;
+        rot_candidate_ = candidate;
+        if (candidate) o.rotation_stuck_s = static_cast<float>(now - rot_since_);
+        if (candidate && now - rot_since_ >= q.dwell_s) {
+          rot_latched_ = true;
+          rot_candidate_ = false;
+          rot_releasing_ = false;
+          rot_since_ = now;
+        }
+      }
+      if (rot_latched_) {
+        // Brief command mismatches at the wiggle's direction changes must not release it.
+        if (turning) {
+          rot_releasing_ = false;
+        } else if (!rot_releasing_) {
+          rot_releasing_ = true;
+          rot_release_since_ = now;
+        }
+        if (rot_releasing_ && now - rot_release_since_ >= q.release_s) {
+          rot_latched_ = false;
+        } else {
+          o.rotation_stuck_s = static_cast<float>(now - rot_since_);
+          double progress = 0.0, pspan = 0.0;
+          if (now - rot_since_ >= q.escalate_after_s && !stale.odom &&
+              yawChange(q.progress_window_s, &progress, &pspan) &&
+              std::fabs(progress) < q.min_progress_deg * kDeg) {
+            rot_latched_ = false;
+            rot_escalated_ = true;
+          }
+        }
+      }
+      // Escalated: stuck until pure pursuit stops turning (spam cancels it on the rising edge).
+      if (rot_escalated_ && !turning) rot_escalated_ = false;
+    }
+    o.rotation_stuck = rot_latched_;
+    o.rotation_escalated = rot_escalated_;
+  }
+
   // Stuck. A stale or too-short odometry window reads as speed 0, so it must not count as standing still.
   // An operator hold is not stuck: the joystick (base command differs from pure pursuit's) or motors off
   // (no torque, wheels still).
@@ -300,14 +399,15 @@ Output SpeedGovernor::update(double now, const Stale& stale) {
     const bool driving = !stale.wheels && have_residual &&
                          (o.effort_residual >= k.min_effort_residual ||
                           std::fabs(o.wheel_speed) >= k.min_wheel_speed);
+    // The wiggle's forward/back moves would look like a linear stuck: suppressed while it runs.
     const bool candidate = k.enable && finite(now) && !stale.odom && speed_valid_ && have_cmd_ && !stale.cmd &&
-                           autonomy && driving &&
+                           autonomy && driving && !rot_latched_ && !rot_escalated_ &&
                            std::fabs(static_cast<float>(cmd_v_)) >= k.min_cmd_v &&
                            static_cast<float>(speed_) < k.max_body_speed;
     if (candidate && !stuck_candidate_) stuck_since_ = now;
     stuck_candidate_ = candidate;
     o.stuck_s = candidate ? static_cast<float>(now - stuck_since_) : 0.f;
-    o.stuck = candidate && now - stuck_since_ >= k.dwell_s;
+    o.stuck = (candidate && now - stuck_since_ >= k.dwell_s) || rot_escalated_;
   }
 
   // Output stage: falls at once, recovers at release_rate.

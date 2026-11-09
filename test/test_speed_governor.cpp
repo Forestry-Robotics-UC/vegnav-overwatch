@@ -696,6 +696,144 @@ TEST(Stuck, NeedsWheelsAndPurePursuit) {
   EXPECT_FALSE(n.run(0.0, 3.0).stuck);
 }
 
+// Rotation stuck: odometry and wheels at 10 Hz, robot parked, yaw advancing at yaw_rate. By default the
+// wheels pivot (0.10 m/s, |effort| 43, as on Nov 6) and pure pursuit's command is the base command.
+struct RotRig {
+  SpeedGovernor g{only(kOnlyTilt)};
+  double t = 0.0, yaw = 0.0;
+  double pivot = 0.10, abs_effort = 43.0;
+  bool autonomy_follows = true;
+  void cmd(double v, double w) {
+    ASSERT_TRUE(g.addCommand(v, w));
+    if (autonomy_follows) {
+      ASSERT_TRUE(g.addAutonomyCommand(v, w));
+    }
+  }
+  Output run(double yaw_rate, double duration, Stale s = Stale()) {
+    Output o;
+    const int n = std::lround(duration * 10.0);
+    for (int i = 0; i < n; ++i) {
+      t += 0.1;
+      yaw += yaw_rate * 0.1;
+      EXPECT_TRUE(g.addOdom(t, Eigen::Vector2d::Zero(), 0.0, 0.0, std::remainder(yaw, 2 * M_PI)));
+      EXPECT_TRUE(g.addWheels(t, 0.0, 0.0, abs_effort, pivot));
+      o = g.update(t, s);
+    }
+    return o;
+  }
+};
+
+TEST(RotationStuck, StalledPivotLatchesAfterDwell) {
+  RotRig r;
+  r.cmd(0.0, 1.0);
+  EXPECT_FALSE(r.run(0.001, 2.5).rotation_stuck);  // 0.7 s to fill the yaw window, then the 2 s dwell
+  const Output o = r.run(0.001, 0.6);
+  EXPECT_TRUE(o.rotation_stuck);
+  EXPECT_FALSE(o.stuck);
+  EXPECT_FLOAT_EQ(o.speed_factor, 1.f);
+}
+
+TEST(RotationStuck, SlowRealPivotIsNotStuck) {
+  RotRig r;
+  r.cmd(0.0, 1.0);
+  EXPECT_FALSE(r.run(0.04, 10.0).rotation_stuck);  // the slowest real pivot on Nov 6
+  EXPECT_FALSE(r.run(-0.04, 10.0).rotation_stuck);
+}
+
+TEST(RotationStuck, YawWrapIsNotMotion) {
+  RotRig r;
+  r.yaw = M_PI - 0.0005;  // sits on the +-pi seam
+  r.cmd(0.0, -1.0);
+  EXPECT_TRUE(r.run(0.001, 4.0).rotation_stuck);
+}
+
+TEST(RotationStuck, NeedsAnInPlaceRotationCommand) {
+  RotRig r;
+  r.cmd(0.6, 1.0);  // driving and turning: the linear rule's job
+  EXPECT_FALSE(r.run(0.0, 5.0).rotation_stuck);
+  RotRig q;
+  q.cmd(0.0, 0.3);  // too gentle a turn
+  EXPECT_FALSE(q.run(0.0, 5.0).rotation_stuck);
+}
+
+TEST(RotationStuck, OperatorHoldsAreNotStuck) {
+  RotRig motors_off;
+  motors_off.pivot = 0.0;
+  motors_off.abs_effort = 2.0;
+  motors_off.cmd(0.0, 1.0);
+  EXPECT_FALSE(motors_off.run(0.0, 5.0).rotation_stuck);
+  RotRig joy;
+  joy.autonomy_follows = false;
+  ASSERT_TRUE(joy.g.addAutonomyCommand(0.0, 1.0));
+  joy.cmd(0.0, 0.0);  // joystick holds still
+  EXPECT_FALSE(joy.run(0.0, 5.0).rotation_stuck);
+  RotRig no_wheels;
+  no_wheels.cmd(0.0, 1.0);
+  Stale s;
+  s.wheels = true;
+  EXPECT_FALSE(no_wheels.run(0.0, 5.0, s).rotation_stuck);
+}
+
+TEST(RotationStuck, StaysLatchedThroughTheWiggleAndReleasesWhenTurningStops) {
+  RotRig r;
+  r.cmd(0.0, 1.0);
+  ASSERT_TRUE(r.run(0.0, 3.0).rotation_stuck);
+  // Wiggle: +-0.2 m/s at 1.2 rad/s, the body now turning; a one-tick mismatch at a direction change
+  for (int k = 0; k < 6; ++k) {
+    r.cmd(k % 2 ? -0.2 : 0.2, 1.2);
+    const Output o = r.run(0.2, 0.7);
+    EXPECT_TRUE(o.rotation_stuck);
+    EXPECT_FALSE(o.stuck);  // the forward/back moves must not trip the linear rule
+  }
+  ASSERT_TRUE(r.g.addCommand(0.2, 1.2));  // base lags pure pursuit for a tick
+  ASSERT_TRUE(r.g.addAutonomyCommand(-0.2, 1.2));
+  EXPECT_TRUE(r.run(0.2, 0.1).rotation_stuck);
+  r.cmd(0.6, 0.1);  // rotation done, tracking again
+  EXPECT_TRUE(r.run(0.0, 0.3).rotation_stuck);
+  EXPECT_FALSE(r.run(0.0, 0.3).rotation_stuck);
+}
+
+TEST(RotationStuck, NoProgressEscalatesToStuck) {
+  RotRig r;
+  r.cmd(0.0, 1.0);
+  ASSERT_TRUE(r.run(0.0, 3.0).rotation_stuck);
+  r.cmd(0.2, 1.2);
+  Output o = r.run(0.0, 14.8);
+  EXPECT_TRUE(o.rotation_stuck);
+  EXPECT_FALSE(o.stuck);
+  o = r.run(0.0, 0.5);
+  EXPECT_FALSE(o.rotation_stuck);
+  EXPECT_TRUE(o.stuck);
+  EXPECT_TRUE(o.rotation_escalated);
+  // spam cancels pure pursuit: its command goes stale and stuck clears
+  Stale s;
+  s.autonomy = true;
+  o = r.run(0.0, 0.1, s);
+  EXPECT_FALSE(o.stuck);
+  EXPECT_FALSE(o.rotation_escalated);
+}
+
+TEST(RotationStuck, SlowWiggleProgressDoesNotEscalate) {
+  RotRig r;
+  r.cmd(0.0, 1.0);
+  ASSERT_TRUE(r.run(0.0, 3.0).rotation_stuck);
+  r.cmd(0.2, 1.2);
+  const Output o = r.run(0.05, 30.0);  // ~23 deg per 8 s
+  EXPECT_TRUE(o.rotation_stuck);
+  EXPECT_FALSE(o.stuck);
+}
+
+TEST(Wheels, PivotSpeedAndAbsEffort) {
+  double net, speed, abs_e, yaw;
+  // CCW pivot: left wheels backward, right forward. Left joints (103, 101) are +fwd, right (102, 100) -fwd.
+  ASSERT_TRUE(wheelsFromJoints({"Joint 102", "Joint 100", "Joint 103", "Joint 101"}, {-1.0, -1.0, -1.0, -1.0},
+                               {-10.0, -10.0, -10.0, -10.0}, 0.13, &net, &speed, &abs_e, &yaw));
+  EXPECT_NEAR(speed, 0.0, 1e-9);
+  EXPECT_NEAR(net, 0.0, 1e-9);
+  EXPECT_NEAR(abs_e, 40.0, 1e-9);
+  EXPECT_NEAR(yaw, 0.13, 1e-9);
+}
+
 TEST(Odom, NonFiniteIsRejectedAndKeepsAttitude) {
   SpeedGovernor g(only(kOnlyTilt));
   ASSERT_TRUE(g.addOdom(0.0, Eigen::Vector2d::Zero(), 20 * kD2R, 0.0));

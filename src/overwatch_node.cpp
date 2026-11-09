@@ -111,6 +111,21 @@ Params loadParams(ros::NodeHandle& pnh) {
   pnh.param("stuck/min_effort_residual", k.min_effort_residual, k.min_effort_residual);
   pnh.param("stuck/min_wheel_speed", k.min_wheel_speed, k.min_wheel_speed);
   pnh.param("stuck/max_cmd_mismatch", k.max_cmd_mismatch, k.max_cmd_mismatch);
+
+  auto& q = p.rotation_stuck;
+  pnh.param("rotation_stuck/enable", q.enable, q.enable);
+  pnh.param("rotation_stuck/min_cmd_w", q.min_cmd_w, q.min_cmd_w);
+  pnh.param("rotation_stuck/max_cmd_v", q.max_cmd_v, q.max_cmd_v);
+  pnh.param("rotation_stuck/yaw_window_s", q.yaw_window_s, q.yaw_window_s);
+  pnh.param("rotation_stuck/max_yaw_rate", q.max_yaw_rate, q.max_yaw_rate);
+  pnh.param("rotation_stuck/dwell_s", q.dwell_s, q.dwell_s);
+  pnh.param("rotation_stuck/max_cmd_w_mismatch", q.max_cmd_w_mismatch, q.max_cmd_w_mismatch);
+  pnh.param("rotation_stuck/min_wheel_yaw_speed", q.min_wheel_yaw_speed, q.min_wheel_yaw_speed);
+  pnh.param("rotation_stuck/min_abs_effort", q.min_abs_effort, q.min_abs_effort);
+  pnh.param("rotation_stuck/release_s", q.release_s, q.release_s);
+  pnh.param("rotation_stuck/escalate_after_s", q.escalate_after_s, q.escalate_after_s);
+  pnh.param("rotation_stuck/progress_window_s", q.progress_window_s, q.progress_window_s);
+  pnh.param("rotation_stuck/min_progress_deg", q.min_progress_deg, q.min_progress_deg);
   return p;
 }
 }  // namespace
@@ -133,6 +148,7 @@ class OverwatchNode {
     if (apply_) {
       factor_pub_ = nh.advertise<std_msgs::Float32>("overwatch/speed_factor", 10);
       stuck_pub_ = nh.advertise<std_msgs::Bool>("overwatch/stuck", 10);
+      rot_stuck_pub_ = nh.advertise<std_msgs::Bool>("overwatch/rotation_stuck", 10);
     }
     sub_imu_ = nh.subscribe("imu/data", 2000, &OverwatchNode::onImu, this);
     sub_odom_ = nh.subscribe("lio_odom", 50, &OverwatchNode::onOdom, this);
@@ -157,23 +173,25 @@ class OverwatchNode {
   void onOdom(const nav_msgs::Odometry& m) {
     float roll, pitch;
     rollPitch(m.pose.pose.orientation, &roll, &pitch);
+    const auto& q = m.pose.pose.orientation;
+    const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
     const Eigen::Vector2d p(m.pose.pose.position.x, m.pose.pose.position.y);
-    if (gov_.addOdom(m.header.stamp.toSec(), p, roll, pitch)) odom_rx_ = ros::Time::now();
+    if (gov_.addOdom(m.header.stamp.toSec(), p, roll, pitch, yaw)) odom_rx_ = ros::Time::now();
   }
 
   void onWheels(const sensor_msgs::JointState& m) {
-    double net, speed;
-    if (wheelsFromJoints(m.name, m.velocity, m.effort, wheel_radius_, &net, &speed) &&
-        gov_.addWheels(m.header.stamp.toSec(), net, speed))
+    double net, speed, abs_effort, yaw_speed;
+    if (wheelsFromJoints(m.name, m.velocity, m.effort, wheel_radius_, &net, &speed, &abs_effort, &yaw_speed) &&
+        gov_.addWheels(m.header.stamp.toSec(), net, speed, abs_effort, yaw_speed))
       wheels_rx_ = ros::Time::now();
   }
 
   void onCmd(const geometry_msgs::TwistStamped& m) {
-    if (gov_.addCommand(m.twist.linear.x)) cmd_rx_ = ros::Time::now();
+    if (gov_.addCommand(m.twist.linear.x, m.twist.angular.z)) cmd_rx_ = ros::Time::now();
   }
 
   void onAutonomyCmd(const geometry_msgs::TwistStamped& m) {
-    if (gov_.addAutonomyCommand(m.twist.linear.x)) auto_rx_ = ros::Time::now();
+    if (gov_.addAutonomyCommand(m.twist.linear.x, m.twist.angular.z)) auto_rx_ = ros::Time::now();
   }
 
   void onImage(const sensor_msgs::Image& m) {
@@ -221,6 +239,8 @@ class OverwatchNode {
       std_msgs::Bool b;
       b.data = o.stuck;
       stuck_pub_.publish(b);
+      b.data = o.rotation_stuck;
+      rot_stuck_pub_.publish(b);
     }
 
     State st;
@@ -249,11 +269,22 @@ class OverwatchNode {
     st.stale = o.stale;
     st.stuck = o.stuck;
     st.stuck_s = o.stuck_s;
+    st.rotation_stuck = o.rotation_stuck;
+    st.rotation_stuck_s = o.rotation_stuck_s;
+    st.rotation_escalated = o.rotation_escalated;
+    st.yaw_rate = o.yaw_rate;
+    st.wheel_yaw_speed = o.wheel_yaw_speed;
+    st.abs_effort = o.abs_effort;
     state_pub_.publish(st);
 
     if (o.stuck != logged_stuck_) {
-      ROS_INFO("overwatch: stuck=%s", o.stuck ? "true" : "false");
+      ROS_INFO("overwatch: stuck=%s%s", o.stuck ? "true" : "false",
+               o.rotation_escalated ? " (wiggle made no progress)" : "");
       logged_stuck_ = o.stuck;
+    }
+    if (o.rotation_stuck != logged_rot_stuck_) {
+      ROS_INFO("overwatch: rotation_stuck=%s", o.rotation_stuck ? "true" : "false");
+      logged_rot_stuck_ = o.rotation_stuck;
     }
     if (o.limiting != logged_limiter_ && (now - last_log_).toSec() >= 1.0) {
       ROS_INFO("overwatch: limiting=%s factor=%.2f", limiterName(o.limiting), o.speed_factor);
@@ -266,12 +297,12 @@ class OverwatchNode {
   bool apply_ = false;
   double imu_yaw_deg_ = 90.0, wheel_radius_ = 0.13;
   double stale_imu_ = 0.2, stale_odom_ = 0.5, stale_wheels_ = 0.5, stale_cmd_ = 0.5, stale_image_ = 0.5;
-  ros::Publisher state_pub_, factor_pub_, stuck_pub_;
+  ros::Publisher state_pub_, factor_pub_, stuck_pub_, rot_stuck_pub_;
   ros::Subscriber sub_imu_, sub_odom_, sub_wheels_, sub_cmd_, sub_auto_, sub_image_, sub_meta_;
   ros::Timer timer_;
   ros::Time imu_rx_, odom_rx_, wheels_rx_, cmd_rx_, auto_rx_, image_rx_, last_log_;
   uint8_t logged_limiter_ = kNone;
-  bool logged_stuck_ = false;
+  bool logged_stuck_ = false, logged_rot_stuck_ = false;
 };
 
 }  // namespace overwatch

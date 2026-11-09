@@ -47,3 +47,12 @@ uint8 stale
 bool stuck                       # pure pursuit drives, the wheels push or spin, the body does not move,
                                  # for stuck/dwell_s; published on /overwatch/stuck
 float32 stuck_s                  # how long the stuck condition has held, 0 when it does not
+
+bool rotation_stuck              # pure pursuit rotates in place, the wheels pivot, LIO yaw does not change,
+                                 # for rotation_stuck/dwell_s; latched while pure pursuit keeps turning;
+                                 # published on /overwatch/rotation_stuck (pure pursuit then wiggles)
+float32 rotation_stuck_s         # candidate time before the latch, then time latched
+bool rotation_escalated          # the wiggle made no progress: stuck is set (back up and replan)
+float32 yaw_rate                 # LIO, over rotation_stuck/yaw_window_s [rad/s]
+float32 wheel_yaw_speed          # (right - left) / 2 wheel speed [m/s], + = CCW
+float32 abs_effort               # sum of |effort| of the four wheels

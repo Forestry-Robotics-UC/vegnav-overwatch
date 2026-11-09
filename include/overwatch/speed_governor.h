@@ -7,6 +7,7 @@
 // Pitch positive = nose down.
 
 #include <Eigen/Geometry>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -21,10 +22,12 @@ float interp(float x, float x0, float x1, float y0, float y1);
 Eigen::Vector2d imuToBase(double ix, double iy, double yaw_rad);
 
 // Signed sum of the four MD80 efforts (+ = forward) and mean forward wheel speed [m/s]. Joint order is
-// not fixed. False unless all four joints are present and finite.
+// not fixed. False unless all four joints are present and finite. Optionally also the sum of |effort|
+// and the wheels' turning speed (right minus left over 2, + = CCW) [m/s], both of which a pivot shows
+// and the signed sums cancel.
 bool wheelsFromJoints(const std::vector<std::string>& names, const std::vector<double>& velocity,
                       const std::vector<double>& effort, double wheel_radius, double* net_effort,
-                      double* wheel_speed);
+                      double* wheel_speed, double* abs_effort = nullptr, double* wheel_yaw_speed = nullptr);
 
 // Keeps a slowdown until the robot has travelled hold_m past the last trigger.
 class DistanceHold {
@@ -75,6 +78,26 @@ struct Params {
     double hold_m = 0.8;
   } push;
 
+  // Rotation stuck: pure pursuit rotates in place, the wheels pivot, the body does not turn. Reported on
+  // /overwatch/rotation_stuck, where pure pursuit switches its rotation to a wiggle; latched while pure
+  // pursuit keeps turning (rotating or wiggling). If the wiggle makes no progress, escalates to stuck
+  // (back up and replan). Never changes the factor.
+  struct RotationStuck {
+    bool enable = true;
+    float min_cmd_w = 0.5f;             // rad/s, |pure pursuit turn rate|
+    float max_cmd_v = 0.05f;            // m/s, |pure pursuit speed| to start: an in-place rotation
+    double yaw_window_s = 1.0;          // LIO yaw rate over this window
+    float max_yaw_rate = 0.02f;         // rad/s; a slow but real pivot on Nov 6 was 0.04-0.10
+    double dwell_s = 2.0;
+    float max_cmd_w_mismatch = 0.1f;    // rad/s, |base - pure pursuit| (joystick excluded)
+    float min_wheel_yaw_speed = 0.05f;  // m/s, |wheel pivot speed| ...
+    float min_abs_effort = 25.f;        // ... or sum |effort|: the drive is trying (motors off excluded)
+    double release_s = 0.5;             // pure pursuit must stop turning this long to release
+    double escalate_after_s = 15.0;     // latched this long and ...
+    double progress_window_s = 8.0;     // ... turned less than min_progress_deg over this window:
+    float min_progress_deg = 15.f;      //     report stuck instead
+  } rotation_stuck;
+
   // Stuck: the drive is commanded but the body does not move. Reported only; it never changes the factor.
   struct Stuck {
     bool enable = true;
@@ -119,6 +142,11 @@ struct Output {
   uint8_t stale = 0;
   bool stuck = false;
   float stuck_s = 0.f;                      // how long the stuck condition has held, 0 when it does not
+  bool rotation_stuck = false;
+  float rotation_stuck_s = 0.f;             // candidate time before the latch, then time latched
+  bool rotation_escalated = false;          // stuck comes from a wiggle that made no progress
+  float yaw_rate = 0.f;                     // LIO, over the rotation-stuck window [rad/s]
+  float wheel_yaw_speed = 0.f, abs_effort = 0.f;
 };
 
 class SpeedGovernor {
@@ -127,10 +155,12 @@ class SpeedGovernor {
 
   // Each returns false when the input was rejected, so the caller does not count it as a live topic.
   bool addImu(double stamp, double gx, double gy);  // base-frame gyro
-  bool addOdom(double stamp, const Eigen::Vector2d& p, double roll, double pitch);
-  bool addWheels(double stamp, double net_effort, double wheel_speed);
-  bool addCommand(double v);
-  bool addAutonomyCommand(double v);  // pure pursuit's output, before the mux
+  // yaw NaN: unknown (the rotation-stuck rule then never fires)
+  bool addOdom(double stamp, const Eigen::Vector2d& p, double roll, double pitch, double yaw = NAN);
+  bool addWheels(double stamp, double net_effort, double wheel_speed, double abs_effort = NAN,
+                 double wheel_yaw_speed = NAN);
+  bool addCommand(double v, double w = 0.0);
+  bool addAutonomyCommand(double v, double w = 0.0);  // pure pursuit's output, before the mux
   // mono16, row-major, rows * step_bytes readable. Only zero / non-zero matters, so byte order does not.
   bool addRangeImage(const uint8_t* data, int rows, int cols, size_t step_bytes);
   bool setBeamAltitudes(const std::vector<float>& deg);
@@ -185,6 +215,17 @@ class SpeedGovernor {
   // Stuck
   double stuck_since_ = 0.0;
   bool stuck_candidate_ = false;
+
+  // Rotation stuck
+  struct YawSample { double t, yaw; };
+  std::deque<YawSample> yaw_hist_;          // unwrapped
+  double yaw_unwrapped_ = 0.0;
+  bool have_yaw_ = false;
+  double cmd_w_ = 0.0, auto_w_ = 0.0;
+  double wheel_abs_effort_ = NAN, wheel_yaw_speed_ = NAN;
+  bool rot_candidate_ = false, rot_latched_ = false, rot_escalated_ = false;
+  double rot_since_ = 0.0, rot_release_since_ = 0.0;
+  bool rot_releasing_ = false;
 
   // Output stage
   float factor_ = 1.f;

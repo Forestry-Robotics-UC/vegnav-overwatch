@@ -70,3 +70,18 @@ stuck:                  # commanded but not moving; reported on /overwatch/stuck
   max_cmd_mismatch: 0.05   # m/s
   min_effort_residual: 8.0 # push residual units
   min_wheel_speed: 0.1     # m/s
+
+rotation_stuck:         # in-place rotation that does not turn; /overwatch/rotation_stuck -> pure pursuit wiggles
+  enable: true
+  min_cmd_w: 0.5           # rad/s, pure pursuit turn rate
+  max_cmd_v: 0.05          # m/s, pure pursuit speed to start (in-place rotation only)
+  yaw_window_s: 1.0
+  max_yaw_rate: 0.02       # rad/s LIO; Nov 6 stall <= 0.003, slow real pivots 0.04-0.10
+  dwell_s: 2.0
+  max_cmd_w_mismatch: 0.1  # rad/s, base vs pure pursuit (joystick excluded)
+  min_wheel_yaw_speed: 0.05 # m/s pivot ...
+  min_abs_effort: 25.0     # ... or sum |effort| (Nov 6 stall: 0.10 m/s, ~43): motors off excluded
+  release_s: 0.5           # pure pursuit stopped turning this long: released
+  escalate_after_s: 15.0   # latched this long with < min_progress_deg over progress_window_s:
+  progress_window_s: 8.0   #   report stuck (back up and replan) instead
+  min_progress_deg: 15.0
